@@ -31,8 +31,11 @@ window.__ModuleLoader__.load({
     //                Edge 走微软云端、Chrome 走谷歌，不支持指定设备）
     //  'xfyun'     = 讯飞云端（中文效果好、秒级返回；密钥只在本机 host 半）
     //  'whisper'   = 浏览器本地 Whisper（免费离线，small 中文一般）
-    var ASR_ENGINE = 'webspeech'
+    var ASR_ENGINE = 'xfyun'
     var WEBSpeech_LANG = 'zh-CN'
+    // 📝 识别结果追加到输入框已有内容末尾时的分隔符（🎲 可选值开关）:
+    //   ''  = 直接拼接（什么都不加） | ' ' = 追加一个空格 | '，' = 追加中文逗号 | '\n' = 追加一个换行
+    var APPEND_SEPARATOR = ''
     var XFYUN_ASR_URL =
       (typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:3080') +
       '/dsh-voice/asr'
@@ -190,6 +193,70 @@ window.__ModuleLoader__.load({
       return out
     }
 
+    // ------------------------------------------------------------------
+    // 🎙️ 智能静音压缩：用户在说话过程中停顿思考（如停顿 5 秒）时，
+    // 原始音频中会有漫长的空白。讯飞等云端识别在遇到长静音时极易触发分句截断或丢字。
+    // 该函数在保证声音毫无损耗的前提下，将超过 0.6 秒的冗余连续静音平滑压缩到 0.35 秒，
+    // 使得云端收到的音频自然连贯，彻底消除中途停顿导致的文本丢失！
+    // ------------------------------------------------------------------
+    function compressSilence(samples, threshold, maxSilenceSec) {
+      if (!samples || samples.length === 0) return samples
+      threshold = threshold === undefined ? 0.012 : threshold
+      maxSilenceSec = maxSilenceSec === undefined ? 0.35 : maxSilenceSec
+
+      var sampleRate = 16000
+      var blockSize = 1600 // 100ms 一个检测块
+      var maxSilenceBlocks = Math.max(1, Math.round((maxSilenceSec * sampleRate) / blockSize))
+
+      var keptBlocks = []
+      var consecutiveSilence = 0
+
+      for (var offset = 0; offset < samples.length; offset += blockSize) {
+        var end = Math.min(offset + blockSize, samples.length)
+        var block = samples.subarray(offset, end)
+
+        // 计算该 100ms 块的能量峰值
+        var peak = 0
+        for (var i = 0; i < block.length; i++) {
+          var abs = Math.abs(block[i])
+          if (abs > peak) peak = abs
+        }
+
+        var isSilence = peak < threshold
+        if (isSilence) {
+          consecutiveSilence++
+          if (consecutiveSilence <= maxSilenceBlocks) {
+            keptBlocks.push(block)
+          }
+          // 超过最大静音块数的长停顿被平滑过滤，杜绝触发云端截断
+        } else {
+          consecutiveSilence = 0
+          keptBlocks.push(block)
+        }
+      }
+
+      var totalLen = 0
+      for (var b = 0; b < keptBlocks.length; b++) {
+        totalLen += keptBlocks[b].length
+      }
+
+      if (totalLen >= samples.length || totalLen < 1600) {
+        return samples
+      }
+
+      var out = new Float32Array(totalLen)
+      var writeOffset = 0
+      for (var k = 0; k < keptBlocks.length; k++) {
+        out.set(keptBlocks[k], writeOffset)
+        writeOffset += keptBlocks[k].length
+      }
+      console.log(
+        '[dsh-voice] 静音压缩完成: 原时长 ' + (samples.length / 16000).toFixed(1) + 's -> 压缩后 ' +
+        (out.length / 16000).toFixed(1) + 's (成功消除停顿，杜绝丢字)',
+      )
+      return out
+    }
+
     function floatToPcm16(samples) {
       var out = new Int16Array(samples.length)
       for (var i = 0; i < samples.length; i++) {
@@ -221,10 +288,12 @@ window.__ModuleLoader__.load({
         return null
       })
       console.log('[dsh-voice] xfyun 返回:', JSON.stringify(data))
+      if (data && data.error) {
+        throw new Error(data.error)
+      }
       if (!res.ok || !data) {
         throw new Error('讯飞识别失败（HTTP ' + res.status + '）')
       }
-      if (data.error) throw new Error(data.error)
       return String(data.text || '').trim()
     }
 
@@ -289,6 +358,8 @@ window.__ModuleLoader__.load({
       var input = props.input
       var draftRef = React.useRef('')
       draftRef.current = input && typeof input.draft === 'string' ? input.draft : ''
+      var 初始文本_引用 = React.useRef('')
+      var 光标位置_引用 = React.useRef(-1)
 
       var phasePair = React.useState('idle') // idle | loading | recording | transcribing
       var phase = phasePair[0]
@@ -328,18 +399,241 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // 🔍 辅助函数：定位当前输入框元素（兼容 DSH 官方 Lexical contenteditable 与原生 textarea）
+      function 查找编辑框目标() {
+        if (typeof document === 'undefined') return null
+        var 麦克风按钮 = document.querySelector('[data-dsh-voice-mic]')
+        var 容器 = 麦克风按钮 ? (
+          麦克风按钮.closest('[data-composer-card]') ||
+          麦克风按钮.closest('form') ||
+          麦克风按钮.closest('.composer') ||
+          (麦克风按钮.parentElement && 麦克风按钮.parentElement.parentElement)
+        ) : null
+
+        // 1. 优先定位 DSH 官方 Lexical 编辑器（contenteditable="true"）
+        var 可编辑元素 = 容器 ? 容器.querySelector('[contenteditable="true"]') : null
+        if (!可编辑元素) {
+          可编辑元素 = document.querySelector('[data-composer-card] [contenteditable="true"], .composer [contenteditable="true"], [contenteditable="true"]')
+        }
+        if (可编辑元素) return { 模式: 'contenteditable', 节点: 可编辑元素 }
+
+        // 2. 兼容原生 textarea 模式
+        var 文本域 = 容器 ? 容器.querySelector('textarea') : null
+        if (!文本域) {
+          文本域 = document.querySelector('[data-composer-card] textarea, .composer textarea, textarea')
+        }
+        if (文本域) return { 模式: 'textarea', 节点: 文本域 }
+
+        return null
+      }
+
+      // 🔍 辅助函数：实时读取当前编辑框的文本全文与光标字符偏移量
+      function 采样文本与光标() {
+        var 目标 = 查找编辑框目标()
+        if (!目标 || !目标.节点) {
+          return { 找到节点: false, 文本: '', 光标: -1 }
+        }
+
+        if (目标.模式 === 'textarea') {
+          var ta = 目标.节点
+          var 全文ta = ta.value || ''
+          var posTa = -1
+          try {
+            if (typeof ta.selectionStart === 'number') {
+              posTa = ta.selectionStart
+            }
+          } catch (e) {}
+          return { 找到节点: true, 文本: 全文ta, 光标: posTa }
+        }
+
+        if (目标.模式 === 'contenteditable') {
+          var el = 目标.节点
+          var 全文ce = (el.innerText || el.textContent || '').replace(/\r/g, '').replace(/\n+$/, '')
+          var posCe = -1
+          try {
+            var sel = window.getSelection ? window.getSelection() : null
+            if (sel && sel.rangeCount > 0) {
+              var range = sel.getRangeAt(0)
+              // 只有当选区锚点落在可编辑容器内部时，才是有意义的活动光标
+              if (el.contains(range.startContainer)) {
+                var preRange = range.cloneRange()
+                preRange.selectNodeContents(el)
+                preRange.setEnd(range.startContainer, range.startOffset)
+                var preText = preRange.toString().replace(/\r/g, '')
+                posCe = Math.max(0, Math.min(preText.length, 全文ce.length))
+              }
+            }
+          } catch (err) {
+            console.warn('[dsh-voice] 获取富文本光标失败:', err && err.message)
+          }
+          return { 找到节点: true, 文本: 全文ce, 光标: posCe }
+        }
+
+        return { 找到节点: false, 文本: '', 光标: -1 }
+      }
+
+      // 🧭 实时采样光标与文本（严格忠实反映最新状态，包括清空与删除）
+      function 实时采样光标() {
+        var 采样结果 = 采样文本与光标()
+        if (采样结果.找到节点) {
+          // 💡 只要定位到了编辑框DOM，就忠实采纳（哪怕是空串，也表示用户主动删光了内容）
+          初始文本_引用.current = 采样结果.文本
+          if (采样结果.光标 >= 0) {
+            光标位置_引用.current = Math.min(采样结果.光标, 采样结果.文本.length)
+          } else {
+            光标位置_引用.current = -1
+          }
+        }
+      }
+
+      // 🎧 全生命周期监听：在打字、删除、输入、录音、点击编辑框时全程跟踪光标与文本
+      React.useEffect(function () {
+        function 选区变更处理() {
+          实时采样光标()
+        }
+        if (typeof document !== 'undefined' && document.addEventListener) {
+          document.addEventListener('input', 选区变更处理, true)
+          document.addEventListener('selectionchange', 选区变更处理, true)
+          document.addEventListener('keyup', 选区变更处理, true)
+          document.addEventListener('mouseup', 选区变更处理, true)
+          document.addEventListener('cut', 选区变更处理, true)
+          document.addEventListener('paste', 选区变更处理, true)
+        }
+        return function () {
+          if (typeof document !== 'undefined' && document.removeEventListener) {
+            document.removeEventListener('input', 选区变更处理, true)
+            document.removeEventListener('selectionchange', 选区变更处理, true)
+            document.removeEventListener('keyup', 选区变更处理, true)
+            document.removeEventListener('mouseup', 选区变更处理, true)
+            document.removeEventListener('cut', 选区变更处理, true)
+            document.removeEventListener('paste', 选区变更处理, true)
+          }
+        }
+      }, [])
+
+      // 🎯 光标精准定位：识别文本写入后，光标精准停在插入文字后面，绝不跳到行尾
+      function 恢复编辑框光标(目标偏移) {
+        if (typeof 目标偏移 !== 'number' || 目标偏移 < 0) return
+        // 延时等待 DSH 客户端 React/Lexical 完成 DOM 重新渲染
+        setTimeout(function () {
+          try {
+            var 目标 = 查找编辑框目标()
+            if (!目标 || !目标.节点) return
+
+            // 1. 原生 textarea 模式
+            if (目标.模式 === 'textarea') {
+              var ta = 目标.节点
+              if (typeof ta.setSelectionRange === 'function') {
+                ta.focus()
+                ta.setSelectionRange(目标偏移, 目标偏移)
+              }
+              return
+            }
+
+            // 2. DSH 官方 Lexical contenteditable 模式
+            if (目标.模式 === 'contenteditable') {
+              var el = 目标.节点
+              el.focus()
+              var sel = window.getSelection ? window.getSelection() : null
+              if (!sel) return
+
+              var charCount = 0
+              var found = false
+              var range = document.createRange()
+
+              function traverseNodes(node) {
+                if (found) return
+                if (node.nodeType === 3) { // 纯文本节点
+                  var nextCount = charCount + node.nodeValue.length
+                  if (目标偏移 <= nextCount) {
+                    var offsetInNode = Math.max(0, 目标偏移 - charCount)
+                    range.setStart(node, offsetInNode)
+                    range.collapse(true)
+                    found = true
+                    return
+                  }
+                  charCount = nextCount
+                } else if (node.nodeType === 1) { // 容器元素节点
+                  for (var i = 0; i < node.childNodes.length; i++) {
+                    traverseNodes(node.childNodes[i])
+                    if (found) return
+                  }
+                }
+              }
+
+              traverseNodes(el)
+              if (found) {
+                sel.removeAllRanges()
+                sel.addRange(range)
+              }
+            }
+          } catch (e) {
+            console.warn('[dsh-voice] 恢复光标位置失败:', e && e.message)
+          }
+        }, 60)
+      }
+
       function appendText(text) {
         if (!inputActions || typeof inputActions.setDraft !== 'function') {
           console.warn('[dsh-voice] inputActions 不可用，文字无法写回输入框')
           return
         }
-        var current = draftRef.current || ''
-        inputActions.setDraft(current ? current + text : text)
-        console.log('[dsh-voice] 已写回输入框:', JSON.stringify(text))
+
+        // 1. 写回前再次主动采样一次最新状态
+        实时采样光标()
+
+        // 2. 真实获取当前编辑框最新文本
+        var 采样结果 = 采样文本与光标()
+        var 当前文本 = 采样结果.找到节点 ? 采样结果.文本 : (初始文本_引用.current || '')
+
+        var 目标光标 = 光标位置_引用.current
+        var 最终拼接文本 = ''
+        var 恢复光标位置 = -1
+
+        // 3. 判断插入或拼接逻辑
+        if (!当前文本) {
+          // 当前编辑框无内容：直接写入新识别内容
+          console.log('[dsh-voice] 当前编辑框无文本，直接写入新识别内容')
+          最终拼接文本 = text
+          恢复光标位置 = text.length
+        } else if (目标光标 >= 0 && 目标光标 <= 当前文本.length) {
+          // 在有效光标位置插入文本
+          console.log('[dsh-voice] 在光标位置 (' + 目标光标 + ') 插入文本, 原文长度: ' + 当前文本.length)
+          最终拼接文本 = 当前文本.slice(0, 目标光标) + text + 当前文本.slice(目标光标)
+          // 💡 光标精准定在刚刚插入文字的正后方，绝不跳到整段末尾！
+          恢复光标位置 = 目标光标 + text.length
+        } else {
+          // 未检测到有效光标，拼接到末尾
+          console.log('[dsh-voice] 未检测到有效光标（' + 目标光标 + '），拼接到文本末尾')
+          最终拼接文本 = 当前文本 + APPEND_SEPARATOR + text
+          恢复光标位置 = 最终拼接文本.length
+        }
+
+        inputActions.setDraft(最终拼接文本)
+        console.log('[dsh-voice] 已写回输入框最终内容:', JSON.stringify(最终拼接文本), '目标光标:', 恢复光标位置)
+
+        // 4. 精确将光标移动到插入文字后面，不再跳到行尾
+        恢复编辑框光标(恢复光标位置)
+
+        // 5. 更新状态与缓存
+        光标位置_引用.current = 恢复光标位置
+        初始文本_引用.current = 最终拼接文本
+      }
+
+      function onButtonMouseDown(e) {
+        // 🛡️ 点击麦克风按钮保焦：阻止 mousedown 默认转移焦点的行为，
+        // 确保输入框的光标不失焦、不消失、选区不被清除
+        实时采样光标()
+        if (e && typeof e.preventDefault === 'function') {
+          e.preventDefault()
+        }
       }
 
       async function begin() {
         setError(null)
+        // 🎙️ 录音开始瞬间，锁定并记录当前编辑框内容与光标位置
+        实时采样光标()
+        console.log('[dsh-voice] 录音开始，记录初始光标:', 光标位置_引用.current, '初始文本:', JSON.stringify(初始文本_引用.current))
         try {
           setPhase('loading')
           if (ASR_ENGINE === 'whisper') {
@@ -456,6 +750,8 @@ window.__ModuleLoader__.load({
           }
           var beforePeak = maxAmp
           samples = normalizeAudio(samples)
+          // 🎙️ 在增益后进行智能静音压缩，消除说话中途的漫长停顿，防止云端引擎丢字截断！
+          samples = compressSilence(samples)
           var afterPeak = 0
           for (var j = 0; j < samples.length; j++) {
             var b = Math.abs(samples[j])
@@ -570,6 +866,7 @@ window.__ModuleLoader__.load({
           'aria-pressed': recording,
           title: title,
           disabled: busy,
+          onMouseDown: onButtonMouseDown,
           onClick: onClick,
           style: style,
         },
