@@ -26,7 +26,7 @@
 ```sh
 dsh plugin --profile web add git+https://github.com/charlie-pan/dsh-voice.git
 客户端：
-原版：github:charlie-pan/dsh-voice
+原版(感谢大佬开发)：github:charlie-pan/dsh-voice
 fix版：github:Karanoyo/dsh-voice-
 ```
 
