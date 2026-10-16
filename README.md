@@ -26,8 +26,8 @@
 ```sh
 dsh plugin --profile web add git+https://github.com/charlie-pan/dsh-voice.git
 客户端：
-github:charlie-pan/dsh-voice
-github:Karanoyo/dsh-voice-
+原版：github:charlie-pan/dsh-voice
+fix版：github:Karanoyo/dsh-voice-
 ```
 
 重启 dsh web 并硬刷新，打开一个会话即可在输入框右下角看到麦克风按钮。
