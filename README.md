@@ -48,7 +48,7 @@ github:Karanoyo/dsh-voice-
 1. 注册 [讯飞开放平台](https://www.xfyun.cn/) → 控制台 →「我的应用」→ 创建应用（开通**语音听写**），拿到 **APPID / APIKey / APISecret**；
 2. 二选一配置（密钥只存在本机，不进浏览器、不要提交到仓库）：
    - **环境变量**：`XFYUN_APPID` / `XFYUN_APIKEY` / `XFYUN_APISECRET`；
-   - **本地文件**：在插件目录放一个 `xfyun.secret.json`（已被 `.gitignore` 忽略）：
+   - **本地文件**：在插件目录放一个 `xfyun.secret.json`（已被 `.gitignore` 忽略）：`C:\Users\%username%\.dsh\profiles\desktop\node_modules\dsh-voice\`
 
 ```json
 { "appId": "…", "apiKey": "…", "apiSecret": "…" }
